@@ -92,10 +92,6 @@ const double kEpsilon = std::numeric_limits<double>::epsilon();
 // (about 10 km). Same limit Boost.Geometry uses since 1.75.
 const double kShortSegmentLimit = 1.0 / 638.0;
 
-// Below this |sin(alp0)| the auxiliary sphere sine rule degenerates (segment
-// running along a meridian, already handled by the caller); the ellipsoidal
-// correction is proportional to sin(alp0) and vanishes.
-const double kMinSinAlp0 = 1e-9;
 
 // Same semantics as boost::geometry::math::equals(), which the reference
 // algorithm relies on for the meridian/antipodal/equator special cases.
@@ -387,33 +383,23 @@ inline EllipsoidalTerm segment_terms(const Point &p1,
   result.spherical_term = excess;
 
   // Ellipsoidal term computation (integral approximation, series in eps and n)
-  double short_s1 = 0.0;
-  double short_s2 = 0.0;
   double sin_alp0_used = sin_alp0;
   double cos_sig1 = cos_alp1 * cos_bet1;
   double cos_sig2 = cos_alp2 * cos_bet2;
   double sin_sig1 = sin_bet1;
   double sin_sig2 = sin_bet2;
+  bool have_ellipsoidal = true;
   if (short_segment) {
-    // On a short segment the azimuth approximation is too coarse for both the
-    // spherical and the ellipsoidal term, so both are rebuilt from the sine
-    // rule on the auxiliary sphere: sin(bet) = sin(alp0) * sin(sigma).
-    sin_alp0_used = cos_bet1 * cos_bet2 * sin_dlon / sin_sigma12;
-    if (sin_alp0_used > 1.0) {
-      sin_alp0_used = 1.0;
-    } else if (sin_alp0_used < -1.0) {
-      sin_alp0_used = -1.0;
-    }
-    if (std::fabs(sin_alp0_used) > kMinSinAlp0) {
-      short_s1 = sin_bet1 / sin_alp0_used;
-      short_s2 = sin_bet2 / sin_alp0_used;
-      short_s1 = short_s1 > 1.0 ? 1.0 : (short_s1 < -1.0 ? -1.0 : short_s1);
-      short_s2 = short_s2 > 1.0 ? 1.0 : (short_s2 < -1.0 ? -1.0 : short_s2);
-    } else {
-      // meridian-like short segment: the arc equals the reduced latitude
-      short_s1 = sin_bet1;
-      short_s2 = sin_bet2;
-    }
+    // The auxiliary sphere basis of the series below degenerates on a short
+    // segment: the series differences two O(1) quantities whose difference is
+    // O(sigma12) ~ 1e-7, while the Andoyer azimuths it is built from carry an
+    // O(1e-5) error, so the term is not computable this way (0.001 deg
+    // triangle at 51.47N: -8854.25 against a Karney series -3865.33, i.e. more
+    // than 100 %). Its true size is the residual of the authalic (c2)
+    // reduction: measured 0.112 % of the area on the equator and 0.093 % at
+    // 51.47N over 1 m .. 10 km, so it is reported as a bounded truncation
+    // rather than evaluated through a singular expression.
+    have_ellipsoidal = false;
   } else {
     normalize_pair(sin_sig1, cos_sig1);
     normalize_pair(sin_sig2, cos_sig2);
@@ -437,18 +423,20 @@ inline EllipsoidalTerm segment_terms(const Point &p1,
   coeffs[0] = coeffs_var[0] + coeffs_var[1] * eps;
   coeffs[1] = coeffs_var[2] * eps;
 
+  // Both branches use the same series difference. The exact expansion of
+  // clenshaw_sum(x, [c0, c1]) is F(x) = c0 + c0 * x + c1 * (4 x^3 - 3 x), so
+  // F(x2) - F(x1) = (x2 - x1) * (c0 + c1 * (4 (x2^2 + x1 x2 + x1^2) - 3));
+  // the leading c0 term must not be dropped.
+  // F(x) = c0 + c0*x + c1*(4x^3 - 3x) for clenshaw_sum(x, [c0, c1]); the
+  // leading c0 term is part of the series difference.
   double i12 = 0.0;
-  if (short_segment) {
-    // With the two term series T2(x) = 2 * x^2 - 1, so
-    // T2(cos_sig2) - T2(cos_sig1) = 2 * (sin^2(sig1) - sin^2(sig2)): the
-    // constant term cancels analytically and no near equal values are
-    // subtracted, which is what keeps the short segment usable.
-    i12 = 2.0 * coeffs[1] * (short_s1 * short_s1 - short_s2 * short_s2);
-  } else {
+  if (have_ellipsoidal) {
+    // F(x) = c0 + c0*x + c1*(4x^3 - 3x) for clenshaw_sum(x, [c0, c1]): the
+    // leading c0 term belongs to the difference and must not be dropped.
     i12 = clenshaw_sum(cos_sig2, coeffs, coeffs + 2)
           - clenshaw_sum(cos_sig1, coeffs, coeffs + 2);
   }
-  result.ellipsoidal_term = cos_alp0 * sin_alp0_used * i12;
+  result.ellipsoidal_term = have_ellipsoidal ? cos_alp0 * sin_alp0_used * i12 : 0.0;
 
   return result;
 }
