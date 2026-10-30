@@ -87,6 +87,16 @@ const double kPi = 3.141592653589793238462643383279502884;
 const double kTwoPi = 2.0 * kPi;
 const double kEpsilon = std::numeric_limits<double>::epsilon();
 
+// Support limit of the trapezoidal short-segment form: the ellipsoidal geodesic
+// and the spherical trapezoid agree to double precision below mean_radius / 638
+// (about 10 km). Same limit Boost.Geometry uses since 1.75.
+const double kShortSegmentLimit = 1.0 / 638.0;
+
+// Below this |sin(alp0)| the auxiliary sphere sine rule degenerates (segment
+// running along a meridian, already handled by the caller); the ellipsoidal
+// correction is proportional to sin(alp0) and vanishes.
+const double kMinSinAlp0 = 1e-9;
+
 // Same semantics as boost::geometry::math::equals(), which the reference
 // algorithm relies on for the meridian/antipodal/equator special cases.
 inline bool equals(double a, double b)
@@ -333,15 +343,37 @@ inline EllipsoidalTerm segment_terms(const Point &p1,
   const double cos_alp2 = std::cos(alp2);
   const double sin_alp0 = sin_alp1 * cos_bet1;
 
+  // Arc between the two points on the auxiliary sphere. It follows from the
+  // reduced latitudes and the longitude difference only, so it does not suffer
+  // from the azimuth approximation used below.
+  const double dlon = lon2 - lon1;
+  const double sin_dlon = std::sin(dlon);
+  const double cos_dlon = std::cos(dlon);
+  const double sin_sigma12 = std::hypot(cos_bet2 * sin_dlon,
+                                        cos_bet1 * sin_bet2 - sin_bet1 * cos_bet2 * cos_dlon);
+  const double cos_sigma12 = sin_bet1 * sin_bet2 + cos_bet1 * cos_bet2 * cos_dlon;
+  const double sigma12 = std::atan2(sin_sigma12, cos_sigma12);
+  // Same support limit Boost.Geometry uses since 1.75 for the trapezoidal form:
+  // below mean_radius / 638 (about 10 km) the spherical trapezoid and the
+  // ellipsoidal geodesic agree to double precision, while the atan2() form
+  // below loses its significant digits because it is built from the azimuth
+  // approximation.
+  const bool short_segment = sigma12 < kShortSegmentLimit;
+
   // Spherical term
   const double sin_omg1 = sin_alp0 * sin_bet1;
   const double cos_omg1 = cos_alp1 * cos_bet1;
   const double sin_omg2 = sin_alp0 * sin_bet2;
-  double cos_omg2 = cos_alp2 * cos_bet2;
+  const double cos_omg2 = cos_alp2 * cos_bet2;
   double cos_omg12 = cos_omg1 * cos_omg2 + sin_omg1 * sin_omg2;
   double excess = 0.0;
 
-  if (cos_omg12 > -0.7 && sin_bet2 - sin_bet1 < 1.75) {  // short segment
+  if (short_segment) {
+    const double bet1 = std::atan(tan_bet1);
+    const double bet2 = std::atan(tan_bet2);
+    excess = 2.0 * std::atan(std::sin((bet1 + bet2) / 2.0)
+                             / std::cos((bet1 - bet2) / 2.0) * std::tan(dlon / 2.0));
+  } else if (cos_omg12 > -0.7 && sin_bet2 - sin_bet1 < 1.75) {  // short segment
     double sin_omg12 = cos_omg1 * sin_omg2 - sin_omg1 * cos_omg2;
     normalize_pair(sin_omg12, cos_omg12);
     const double cos_omg12p1 = 1.0 + cos_omg12;
@@ -355,13 +387,39 @@ inline EllipsoidalTerm segment_terms(const Point &p1,
   result.spherical_term = excess;
 
   // Ellipsoidal term computation (integral approximation, series in eps and n)
-  const double cos_alp0 = std::sqrt(1.0 - sqr(sin_alp0));
+  double short_s1 = 0.0;
+  double short_s2 = 0.0;
+  double sin_alp0_used = sin_alp0;
   double cos_sig1 = cos_alp1 * cos_bet1;
   double cos_sig2 = cos_alp2 * cos_bet2;
   double sin_sig1 = sin_bet1;
   double sin_sig2 = sin_bet2;
-  normalize_pair(sin_sig1, cos_sig1);
-  normalize_pair(sin_sig2, cos_sig2);
+  if (short_segment) {
+    // On a short segment the azimuth approximation is too coarse for both the
+    // spherical and the ellipsoidal term, so both are rebuilt from the sine
+    // rule on the auxiliary sphere: sin(bet) = sin(alp0) * sin(sigma).
+    sin_alp0_used = cos_bet1 * cos_bet2 * sin_dlon / sin_sigma12;
+    if (sin_alp0_used > 1.0) {
+      sin_alp0_used = 1.0;
+    } else if (sin_alp0_used < -1.0) {
+      sin_alp0_used = -1.0;
+    }
+    if (std::fabs(sin_alp0_used) > kMinSinAlp0) {
+      short_s1 = sin_bet1 / sin_alp0_used;
+      short_s2 = sin_bet2 / sin_alp0_used;
+      short_s1 = short_s1 > 1.0 ? 1.0 : (short_s1 < -1.0 ? -1.0 : short_s1);
+      short_s2 = short_s2 > 1.0 ? 1.0 : (short_s2 < -1.0 ? -1.0 : short_s2);
+    } else {
+      // meridian-like short segment: the arc equals the reduced latitude
+      short_s1 = sin_bet1;
+      short_s2 = sin_bet2;
+    }
+  } else {
+    normalize_pair(sin_sig1, cos_sig1);
+    normalize_pair(sin_sig2, cos_sig2);
+  }
+
+  const double cos_alp0 = std::sqrt(1.0 - sqr(sin_alp0_used));
 
   // SeriesOrder == 1: three n-polynomials, two eps-polynomials.
   double coeffs_var[3];
@@ -379,9 +437,18 @@ inline EllipsoidalTerm segment_terms(const Point &p1,
   coeffs[0] = coeffs_var[0] + coeffs_var[1] * eps;
   coeffs[1] = coeffs_var[2] * eps;
 
-  const double i12 = clenshaw_sum(cos_sig2, coeffs, coeffs + 2)
-                     - clenshaw_sum(cos_sig1, coeffs, coeffs + 2);
-  result.ellipsoidal_term = cos_alp0 * sin_alp0 * i12;
+  double i12 = 0.0;
+  if (short_segment) {
+    // With the two term series T2(x) = 2 * x^2 - 1, so
+    // T2(cos_sig2) - T2(cos_sig1) = 2 * (sin^2(sig1) - sin^2(sig2)): the
+    // constant term cancels analytically and no near equal values are
+    // subtracted, which is what keeps the short segment usable.
+    i12 = 2.0 * coeffs[1] * (short_s1 * short_s1 - short_s2 * short_s2);
+  } else {
+    i12 = clenshaw_sum(cos_sig2, coeffs, coeffs + 2)
+          - clenshaw_sum(cos_sig1, coeffs, coeffs + 2);
+  }
+  result.ellipsoidal_term = cos_alp0 * sin_alp0_used * i12;
 
   return result;
 }
