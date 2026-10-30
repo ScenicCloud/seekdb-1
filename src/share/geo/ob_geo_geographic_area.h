@@ -365,10 +365,9 @@ inline EllipsoidalTerm segment_terms(const Point &p1,
   double excess = 0.0;
 
   if (short_segment) {
-    const double bet1 = std::atan(tan_bet1);
-    const double bet2 = std::atan(tan_bet2);
-    excess = 2.0 * std::atan(std::sin((bet1 + bet2) / 2.0)
-                             / std::cos((bet1 - bet2) / 2.0) * std::tan(dlon / 2.0));
+    const double t1 = std::tan(lat1 / 2.0);
+    const double t2 = std::tan(lat2 / 2.0);
+    excess = 2.0 * std::atan(((t1 + t2) / (1.0 + t1 * t2)) * std::tan(dlon / 2.0));
   } else if (cos_omg12 > -0.7 && sin_bet2 - sin_bet1 < 1.75) {  // short segment
     double sin_omg12 = cos_omg1 * sin_omg2 - sin_omg1 * cos_omg2;
     normalize_pair(sin_omg12, cos_omg12);
@@ -388,22 +387,13 @@ inline EllipsoidalTerm segment_terms(const Point &p1,
   double cos_sig2 = cos_alp2 * cos_bet2;
   double sin_sig1 = sin_bet1;
   double sin_sig2 = sin_bet2;
-  bool have_ellipsoidal = true;
-  if (short_segment) {
-    // The auxiliary sphere basis of the series below degenerates on a short
-    // segment: the series differences two O(1) quantities whose difference is
-    // O(sigma12) ~ 1e-7, while the Andoyer azimuths it is built from carry an
-    // O(1e-5) error, so the term is not computable this way (0.001 deg
-    // triangle at 51.47N: -8854.25 against a Karney series -3865.33, i.e. more
-    // than 100 %). Its true size is the residual of the authalic (c2)
-    // reduction: measured 0.112 % of the area on the equator and 0.093 % at
-    // 51.47N over 1 m .. 10 km, so it is reported as a bounded truncation
-    // rather than evaluated through a singular expression.
-    have_ellipsoidal = false;
-  } else {
-    normalize_pair(sin_sig1, cos_sig1);
-    normalize_pair(sin_sig2, cos_sig2);
-  }
+  // The ellipsoidal term is evaluated exactly as the long segment path does:
+  // the reviewer's segment comparison shows the 1.74 port of
+  // area_formulas::ellipsoidal agrees bit for bit with Boost 1.90 on these
+  // inputs, so the azimuth approximation is not the source of the short
+  // segment error (only the spherical term was).
+  normalize_pair(sin_sig1, cos_sig1);
+  normalize_pair(sin_sig2, cos_sig2);
 
   const double cos_alp0 = std::sqrt(1.0 - sqr(sin_alp0_used));
 
@@ -429,14 +419,9 @@ inline EllipsoidalTerm segment_terms(const Point &p1,
   // the leading c0 term must not be dropped.
   // F(x) = c0 + c0*x + c1*(4x^3 - 3x) for clenshaw_sum(x, [c0, c1]); the
   // leading c0 term is part of the series difference.
-  double i12 = 0.0;
-  if (have_ellipsoidal) {
-    // F(x) = c0 + c0*x + c1*(4x^3 - 3x) for clenshaw_sum(x, [c0, c1]): the
-    // leading c0 term belongs to the difference and must not be dropped.
-    i12 = clenshaw_sum(cos_sig2, coeffs, coeffs + 2)
-          - clenshaw_sum(cos_sig1, coeffs, coeffs + 2);
-  }
-  result.ellipsoidal_term = have_ellipsoidal ? cos_alp0 * sin_alp0_used * i12 : 0.0;
+  const double i12 = clenshaw_sum(cos_sig2, coeffs, coeffs + 2)
+                     - clenshaw_sum(cos_sig1, coeffs, coeffs + 2);
+  result.ellipsoidal_term = cos_alp0 * sin_alp0_used * i12;
 
   return result;
 }
