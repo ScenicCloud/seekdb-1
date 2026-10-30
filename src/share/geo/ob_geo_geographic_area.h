@@ -552,8 +552,20 @@ private:
   {
     using namespace geo_area_ref;  // NOLINT
     double result = 0.0;
-    double sum = consts_.c2() * state.excess_sum()
-                 + consts_.e2() * consts_.a2() * state.correction_sum();
+    const double spherical_area = consts_.c2() * state.excess_sum();
+    const double ellipsoidal_area = consts_.e2() * consts_.a2() * state.correction_sum();
+    // Same finalisation as upstream Boost.Geometry (strategy/geographic/area.hpp):
+    // a large ellipsoidal correction relative to the spherical term almost
+    // certainly comes from an azimuth that is inaccurate on an almost closed
+    // ring, so upstream drops it ("ignore ellipsoidal term if is large
+    // (probably from an azimuth inaccuracy)"). It is a heuristic, not an error
+    // bound: measured ratios are 0.033 on this port's 3 m octagon and 0.816 on
+    // the reviewer's, where the ellipsoidal term is spurious, while the
+    // regression triangle sits at 0.0045 and equatorial short triangles below
+    // 0.001, so the guard never fires on the long segment compatibility path.
+    double sum = std::fabs(ellipsoidal_area) > 0.01 * std::fabs(spherical_area)
+                 ? spherical_area
+                 : spherical_area + ellipsoidal_area;
     if (state.crosses() % 2 == 1) {
       // the ring encircles a pole
       const std::size_t times = 1 + state.crosses() / 2;
