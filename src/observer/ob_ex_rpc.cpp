@@ -84,11 +84,11 @@ static int dispatch_(int64_t timeout_us, std::function<int()> fn, SyncCtx *sync_
     ret = OB_ALLOCATE_MEMORY_FAILED;
   } else {
     task->proc_.fn_ = std::move(fn);
-    // Worker::is_timeout() compares against ObTimeUtility::current_time(), and so
-    // does every SQL-side deadline producer, so build this deadline in the same
-    // domain. ObClockGenerator::getClock() is a cached clock that lags the wall
-    // clock after a backward step; using it here made the dispatched task expire
-    // immediately (or never) relative to the Worker comparison.
+    // Build this deadline from the wall clock, like the other 72 producers and
+    // like the Worker comparison. The cached ObClockGenerator clock retains its
+    // pre-step value after a backward step, which pushed this deadline a whole
+    // step into the wall-clock future: the task silently got timeout_us + step
+    // instead of timeout_us. A forward step shortened it by the same amount.
     task->proc_.timeout_ts_ = ObTimeUtility::current_time() + timeout_us;
     task->proc_.sync_ctx_ = sync_ctx;
     task->proc_.trace_id_.set(*ObCurTraceId::get_trace_id());
